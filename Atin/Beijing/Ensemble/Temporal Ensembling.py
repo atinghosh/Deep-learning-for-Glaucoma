@@ -32,22 +32,75 @@ from sklearn import metrics
 
 import sys
 import warnings
+import math
 
 from collections import Counter
+from random import shuffle
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+def make_balance(small_list, big_list):
+    ratio = math.floor(len(big_list) / len(small_list))
+    if ratio > .5:
+        final_list = small_list * (ratio + 1) + big_list
+    else:
+        final_list = small_list * ratio + big_list
+
+    shuffle(final_list)
+    return final_list
+
 
 
 def beijing_pre_process(path):
     patient_id = list({x.split('_')[0] for x in os.listdir(path)})
 
 
+# class Beijing_dataset(Dataset):
+#
+#     def __init__(self, root_dir, patient_id_G, patient_id_H, slices_id="6", transform=None):
+#         self.root_dir = root_dir
+#         self.patient_id_G = patient_id_G
+#         self.patient_id_H = patient_id_H
+#         self.slices = slices_id
+#         self.transform = transform
+#
+#     def __len__(self):
+#
+#         return len(self.patient_id_G) + len(self.patient_id_H)
+#
+#     def __getitem__(self, idx):
+#         if idx < len(self.patient_id_G):
+#             file_name = "glaucoma/" + self.patient_id_G[idx] + "_" + self.slices + "_G.png"
+#             train_y = 1
+#             id = self.patient_id_G[idx]
+#         else:
+#             idx_new = idx - len(self.patient_id_G)
+#             file_name = "healthy/" + self.patient_id_H[idx_new] + "_" + self.slices + "_H.png"
+#             train_y = 0
+#             id = self.patient_id_H[idx_new]
+#
+#         loc = os.path.join(self.root_dir, file_name)
+#         im = plt.imread(loc)
+#         # im = imresize(im, (143, 400),interp='nearest') #original image size is
+#         # im = imresize(im, (200, 400), interp='nearest')
+#         im = imresize(im, (125, 350), interp='nearest')
+#         im = im / 255
+#         # im = np.expand_dims(im,0)
+#         # im = im.transpose((1,2,0))
+#
+#         if self.transform is not None:
+#             im = self.transform(im)
+#
+#         return im, train_y, id
+
+
 class Beijing_dataset(Dataset):
 
-    def __init__(self, root_dir, patient_id_G, patient_id_H, slices_id="6", transform=None):
+    def __init__(self, root_dir, patient_id_G, patient_id_H, balanced_patient_id, slices_id="6", transform=None):
         self.root_dir = root_dir
         self.patient_id_G = patient_id_G
         self.patient_id_H = patient_id_H
+        self.patient_id = balanced_patient_id
         self.slices = slices_id
         self.transform = transform
 
@@ -56,13 +109,17 @@ class Beijing_dataset(Dataset):
         return len(self.patient_id_G) + len(self.patient_id_H)
 
     def __getitem__(self, idx):
-        if idx < len(self.patient_id_G):
-            file_name = "glaucoma/" + self.patient_id_G[idx] + "_" + self.slices + "_G.png"
-            train_y = 1
-        else:
-            idx_new = idx - len(self.patient_id_G)
-            file_name = "healthy/" + self.patient_id_H[idx_new] + "_" + self.slices + "_H.png"
+
+        current_id = self.patient_id[idx]
+        if current_id in self.patient_id_H:
+            file_name = "healthy/" + self.patient_id[idx] + "_" + self.slices + "_H.png"
             train_y = 0
+            id = self.patient_id[idx]
+        else:
+            file_name = "glaucoma/" + self.patient_id[idx] + "_" + self.slices + "_G.png"
+            train_y = 1
+            id = self.patient_id[idx]
+
 
         loc = os.path.join(self.root_dir, file_name)
         im = plt.imread(loc)
@@ -76,7 +133,7 @@ class Beijing_dataset(Dataset):
         if self.transform is not None:
             im = self.transform(im)
 
-        return im, train_y
+        return im, train_y, id
 
 
 class Attention_nonlinear(nn.Module):
@@ -257,52 +314,99 @@ def train(epoch, model, dataloader, optimizer):
     print('\nTrain set: Average loss: {:.4f}'.format(train_loss))
 
 
-def tempral_ensemble_train(nb_epoch, model, dataloader, optimizer):
+def temporal_ensemble_train(nb_epoch, model, dataloader, optimizer, testloader, alpha = .6):
     model.train()
-
-    train_loss = 0
-    # correct = 0
-
-    kont = 0
-
+    x = np.linspace(0, 1, nb_epoch)
+    auc_history = []
     for ep in range(nb_epoch):
-        for batch_id, (data, target) in enumerate(dataloader):
+        if ep ==0:
+            old_pred = dict()
+        train_loss = 0
+        kont = 0
+
+        for batch_id, (data, target, id) in enumerate(dataloader):
             kont += data.size(0)
-            data, target = data.type(torch.FloatTensor).cuda(), target.type(torch.LongTensor).cuda()
+            data, target= data.type(torch.FloatTensor).cuda(), target.type(torch.LongTensor).cuda()
             data, target = Variable(data), Variable(target)
             optimizer.zero_grad()
             output = model(data)
 
+            current_pred = dict(zip(id, output))
+            if ep ==0:
+                old_pred.update(current_pred)
+                loss = F.cross_entropy(input=output, target=target)
+                loss.backward()
+                optimizer.step()
+                train_loss = train_loss + loss.data[0] * data.size(0)
+            else:
+                target_output = []
+                ind = 0
+                for key in id:
+                    old_pred_key = old_pred[key]
+                    old_pred_key = alpha * old_pred_key + (1-alpha) * output[ind]
+                    old_pred[key] = old_pred_key
+                    ind +=1
+                    old_pred_key = old_pred_key / (1 - alpha ** ep)
+                    target_output.append(old_pred_key.unsqueeze(0))
 
-    for batch_id, (data, target) in enumerate(dataloader):
-        kont += data.size(0)
-        data, target = data.type(torch.FloatTensor).cuda(), target.type(torch.LongTensor).cuda()
-        data, target = Variable(data), Variable(target)
-        optimizer.zero_grad()
-        output = model(data)
+                target_output = torch.cat(target_output)
+                target_output = target_output.detach()
+                diag_loss = F.cross_entropy(input=output, target=target)
+                temporal_loss = F.mse_loss(output,target_output)
+                w = math.exp(-5*(1-x[ep-1])**2)
+                loss = diag_loss + w * temporal_loss
+                loss.backward()
+                optimizer.step()
+                train_loss = train_loss + loss.data[0] * data.size(0)
 
-        # loss = F.cross_entropy(input=output, target=target)
+            if batch_id % 50 == 0:
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                ep, batch_id * len(data), len(dataloader.dataset), 100. * batch_id / len(dataloader), loss.data[0]))
 
-        loss = F.cross_entropy(input=output, target=target)
-        train_loss = train_loss + loss.data[0] * data.size(0)
-        # train_loss = train_loss + loss.data[0]
+        train_loss /= kont
+        print('\nTrain set: Average loss: {:.4f}'.format(train_loss))
+        auc_history.append(auc_cal(model, testloader))
+        print("Test AUC:", auc_history[-1])
+    print(auc_history)
 
-        loss.backward()
-        optimizer.step()
 
-        if batch_id % 50 == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_id * len(data), len(dataloader.dataset), 100. * batch_id / len(dataloader), loss.data[0]))
 
-    train_loss /= kont
-    print('\nTrain set: Average loss: {:.4f}'.format(train_loss))
+
+
+
+
+
+
+
+    # for batch_id, (data, target) in enumerate(dataloader):
+    #     kont += data.size(0)
+    #     data, target = data.type(torch.FloatTensor).cuda(), target.type(torch.LongTensor).cuda()
+    #     data, target = Variable(data), Variable(target)
+    #     optimizer.zero_grad()
+    #     output = model(data)
+    #
+    #     # loss = F.cross_entropy(input=output, target=target)
+    #
+    #     loss = F.cross_entropy(input=output, target=target)
+    #     train_loss = train_loss + loss.data[0] * data.size(0)
+    #     # train_loss = train_loss + loss.data[0]
+    #
+    #     loss.backward()
+    #     optimizer.step()
+    #
+    #     if batch_id % 50 == 0:
+    #         print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+    #             epoch, batch_id * len(data), len(dataloader.dataset), 100. * batch_id / len(dataloader), loss.data[0]))
+    #
+    # train_loss /= kont
+    # print('\nTrain set: Average loss: {:.4f}'.format(train_loss))
 
 
 def test(model, testloader):
     model.eval()
     test_loss = 0
     correct = 0
-    for _, (data, target) in enumerate(testloader):
+    for _, (data, target,_) in enumerate(testloader):
         data, target = data.type(torch.FloatTensor).cuda(), target.type(torch.LongTensor).cuda()
         data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
@@ -321,30 +425,39 @@ def auc_cal(model, testloader):
     test_loss = 0
     correct = 0
 
-    final_pred = []
-    for _, (data, target) in enumerate(testloader):
+    final_predicted = []
+    final_target = []
+    for _, (data, target, _) in enumerate(testloader):
         data, target = data.type(torch.FloatTensor).cuda(), target.type(torch.LongTensor).cuda()
         data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
 
         test_loss = test_loss + F.cross_entropy(output, target, size_average=False).data[0]
-        pred = output.data.max(1, keepdim=True)[1]
-        new_pred = pred.cpu().numpy().reshape(len(testloader.dataset), )
-        final_pred.append(new_pred)
 
+        test_loss = test_loss + F.cross_entropy(output, target, size_average=False).data[0]
+        pred = output.data.max(1, keepdim=True)[1]
         correct = correct + pred.eq(target.data.view_as(pred)).cpu().sum()
 
         output = np.exp(output.data.cpu().numpy())
-        predicted = output / np.sum(output, axis=1).reshape(len(testloader.dataset), 1)
-        target = target.data.cpu().numpy()
-        fpr, tpr, thresholds = metrics.roc_curve(1 + target, predicted[:, 1], pos_label=2)
+        final_predicted.append(output / np.sum(output, axis=1).reshape(data.size(0), 1))
+        final_target.append(target.data.cpu().numpy())
+
+        # pred = output.data.max(1, keepdim=True)[1]
+        # correct = correct + pred.eq(target.data.view_as(pred)).cpu().sum()
+        #
+        # output = np.exp(output.data.cpu().numpy())
+        # predicted = output / np.sum(output, axis=1).reshape(len(testloader.dataset),1)
+        # target = target.data.cpu().numpy()
+        #
+        # final_predicted.append(output / np.sum(output, axis=1).reshape(len(data), 1))
+        # final_target.append(target.data.cpu().numpy())
+        # fpr, tpr, thresholds = metrics.roc_curve(1 + target, predicted[:, 1], pos_label=2)
+
+    final_predicted = np.concatenate(final_predicted, 0)
+    final_target = np.concatenate(final_target, 0)
+    fpr, tpr, thresholds = metrics.roc_curve(1 + final_target, final_predicted[:, 1], pos_label=2)
 
     test_loss /= len(testloader.dataset)
-
-    glaucoma_pred = np.count_nonzero(final_pred)
-    print("Predicted Healthy: {} and Predicted Glaucoma: {}".format(len(testloader.dataset) - glaucoma_pred,
-                                                                    glaucoma_pred))
-
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(testloader.dataset),
         100. * correct / len(testloader.dataset)))
@@ -402,11 +515,15 @@ if __name__ == "__main__":
     random.seed(c)
     print("random seed: {}".format(c))
 
-    patient_id_G_test = random.sample(patient_id_G, 20)
-    patient_id_H_test = random.sample(patient_id_H, 200)
+    patient_id_G_test = random.sample(patient_id_G, 50)
+    patient_id_H_test = random.sample(patient_id_H, 500)
 
     patient_id_G_train = list(patient_id_G.difference(patient_id_G_test))
     patient_id_H_train = list(patient_id_H.difference(patient_id_H_test))
+
+
+    final_train = make_balance(patient_id_G_train, patient_id_H_train)
+    final_test = patient_id_G_test + patient_id_H_test
 
     # transformed_images = Beijing_dataset(root_dir,patient_id_G_train,patient_id_H_train)
 
@@ -422,9 +539,14 @@ if __name__ == "__main__":
                                           # tr.RangeNormalize(0, 1)
                                           ])
 
-    transformed_images = Beijing_dataset(root_dir, patient_id_G_train, patient_id_H_train,
+    transformed_images = Beijing_dataset(root_dir, patient_id_G_train, patient_id_H_train,final_train,
                                          transform=transform_pipeline_train)
+    dataloader = DataLoader(transformed_images, batch_size=16, num_workers=10)
+    testdataset = Beijing_dataset(root_dir, patient_id_G_test, patient_id_H_test, final_test, transform=transform_pipeline_test)
+    testloader = DataLoader(testdataset, batch_size=16, shuffle=True, num_workers=20)
 
+    # transformed_images = Beijing_dataset(root_dir, patient_id_G_train, patient_id_H_train,
+    #                                      transform=transform_pipeline_train)
     # transformed_images = Beijing_dataset(root_dir,patient_id_G_train,patient_id_H_train,transform=transforms.Compose([Horizontalflip(),
     #                                                                    RandomRotate(angle_range=(0, 5), prob=0,
     #                                                                                 mode="constant"),
@@ -433,21 +555,21 @@ if __name__ == "__main__":
     #                                                                                mode="constant"),
     #                                                                    ToTensor()]))
 
-    prob = np.array([len(patient_id_G_train), len(patient_id_H_train)])
-    prob = 1 / prob
+    # prob = np.array([len(patient_id_G_train), len(patient_id_H_train)])
+    # prob = 1 / prob
+    #
+    # weight = [prob[0]] * len(patient_id_G_train) + [prob[1]] * len(patient_id_H_train)
+    # sampler = WeightedRandomSampler(weight, len(weight))
 
-    weight = [prob[0]] * len(patient_id_G_train) + [prob[1]] * len(patient_id_H_train)
-    sampler = WeightedRandomSampler(weight, len(weight))
-
-    dataloader = DataLoader(transformed_images, batch_size=16, num_workers=10, sampler=sampler)
+    # dataloader = DataLoader(transformed_images, batch_size=32, num_workers=10, sampler=sampler)
     # dataloader = DataLoader(transformed_images, batch_size=16, num_workers=10, shuffle=True)
 
     # testdataset = Beijing_dataset(root_dir,patient_id_G_test,patient_id_H_test, transform= transforms.Compose([ToTensor()]))
-    testdataset = Beijing_dataset(root_dir, patient_id_G_test, patient_id_H_test, transform=transform_pipeline_test)
+    # testdataset = Beijing_dataset(root_dir, patient_id_G_test, patient_id_H_test, transform=transform_pipeline_test)
 
     # testdataset = Beijing_dataset(root_dir,patient_id_G_test,patient_id_H_test)
 
-    testloader = DataLoader(testdataset, batch_size=len(testdataset), shuffle=True, num_workers=20)
+    # testloader = DataLoader(testdataset, batch_size=len(testdataset), shuffle=True, num_workers=20)
 
     # config = dict(
     #     title="An Experiment",
@@ -466,14 +588,15 @@ if __name__ == "__main__":
     model.cuda()
 
     # optimizer = optim.SGD(model.parameters(), lr=.01, momentum=.5)
-    optimizer = optim.Adam(model.parameters(), lr=.001, weight_decay=.000001)
+    optimizer = optim.Adam(model.parameters(), lr=.0001, weight_decay=.000001)
     # optimizer = optim.Adadelta(model.parameters(),weight_decay=.00001)
 
-    nb_epoch = 100
-    for epoch in range(1, nb_epoch + 1):
-        train(epoch, model, dataloader, optimizer)
-        print("Test AUC:", auc_cal(model, testloader))
-        # test(model, testloader)
+    nb_epoch = 1000
+    temporal_ensemble_train(nb_epoch, model, dataloader, optimizer, testloader)
+    # for epoch in range(1, nb_epoch + 1):
+    #     train(epoch, model, dataloader, optimizer)
+    #     print("Test AUC:", auc_cal(model, testloader))
+    #     # test(model, testloader)
 
     # predicted_test_prob = prediction(X_test)
     # predicted_train_prob = prediction(X_train)
